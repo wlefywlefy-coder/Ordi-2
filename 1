@@ -1,0 +1,267 @@
+# -*- coding: utf-8 -*-
+import requests
+import pandas as pd
+import numpy as np
+import time
+import datetime as dt
+
+# =========================================================
+# 1) الإعدادات – نمط مضارب هجومي
+# =========================================================
+BINANCE_API_URL = 'https://api.binance.com/api/v3'
+SYMBOLS = ['LPTUSDT', 'ORDIUSDT']
+
+ATR_PERIOD = 14
+ATR_MULTIPLIER_SL = 0.8     # وقف خسارة مضارب (أضيق)
+VOL_MULTIPLIER = 1.2        # الحجم المطلوب لتأكيد الاختراق
+RSI_BREAKOUT_THRESHOLD = 48 # زخم مبكر للمضارب
+UPTREND_NEAR_RATIO = 0.98   # سماح بانعكاس مبكر: SMA20 >= 0.98 * EMA50
+BODY_ATR_FACTOR = 0.4       # جسم شمعة الاختراق ≥ 0.4*ATR
+
+# مستويات محورية يدوية (تقدر تغيّرها)
+PIVOT_LEVELS = {
+    'LPTUSDT': 5.20,
+    'ORDIUSDT': 4.12
+}
+
+# آلة الحالات
+TRADING_STATES = {
+    sym: {
+        'state': 'WAITING',
+        'entry_price': 0.0,
+        'stop_loss': 0.0,
+        'target_1R': 0.0,
+        'pivot': PIVOT_LEVELS[sym]
+    } for sym in SYMBOLS
+}
+
+# أيقونات لطباعة أوضح
+HEAD = {
+    "WAITING": "🚶",
+    "SCOUT": "🟠",
+    "ARMED": "⚔️",
+    "BREAKOUT": "🚀",
+    "FAKEOUT": "⛔",
+    "LONG": "🟢",
+    "EXIT": "🛑",
+    "MANAGE": "✅"
+}
+
+# =========================================================
+# 2) مؤشرات
+# =========================================================
+def calculate_sma(df, period):
+    df[f'SMA_{period}'] = df['close'].rolling(window=period).mean()
+    return df
+
+def calculate_ema(df, period):
+    df[f'EMA_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
+    return df
+
+def calculate_rsi(df, period=14):
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    return df
+
+def calculate_atr(df, period=14):
+    hl = df['high'] - df['low']
+    hc = (df['high'] - df['close'].shift(1)).abs()
+    lc = (df['low'] - df['close'].shift(1)).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    df['ATR'] = tr.ewm(span=period, adjust=False).mean()
+    return df
+
+# =========================================================
+# 3) جلب البيانات من بينانس (Requests مباشرة)
+# =========================================================
+def fetch_ohlcv(symbol, interval, limit=200):
+    try:
+        url = f"{BINANCE_API_URL}/klines"
+        params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        df = pd.DataFrame(data, columns=[
+            'timestamp','open','high','low','close','volume',
+            'c1','c2','c3','c4','c5','c6'
+        ])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        for col in ['open','high','low','close','volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df[['timestamp','open','high','low','close','volume']].dropna()
+        df.set_index('timestamp', inplace=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def analyze_liquidity(symbol, depth_limit=100):
+    """إرجاع أفضل سعر حالٍ (استخدام كتاب الأوامر)"""
+    try:
+        url = f"{BINANCE_API_URL}/depth"
+        params = {'symbol': symbol, 'limit': depth_limit}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        ob = r.json()
+        asks = ob.get('asks', [])
+        bids = ob.get('bids', [])
+        best_ask = float(asks[0][0]) if asks else None
+        best_bid = float(bids[0][0]) if bids else None
+        if best_ask and best_bid:
+            return (best_ask + best_bid) / 2.0
+        return best_ask or best_bid
+    except Exception:
+        return None
+
+def get_market_data(symbol):
+    data = {}
+
+    # 15m – إطار التنفيذ
+    df15 = fetch_ohlcv(symbol, '15m', limit=120)
+    if df15.empty: return None
+    df15 = calculate_sma(df15, 20)
+    df15 = calculate_ema(df15, 50)
+    df15 = calculate_rsi(df15, 14)
+    df15 = calculate_atr(df15, ATR_PERIOD)
+    data['df15'] = df15
+
+    # 4h – الاتجاه العام
+    df4h = fetch_ohlcv(symbol, '4h', limit=80)
+    if df4h.empty: return None
+    df4h = calculate_sma(df4h, 20)
+    df4h = calculate_ema(df4h, 50)
+    data['df4h'] = df4h
+
+    # سعر لحظي
+    px = analyze_liquidity(symbol, 100)
+    if px is None: return None
+    data['price'] = px
+
+    return data
+
+# =========================================================
+# 4) محرك الـ ATS (مضارب هجومي)
+# =========================================================
+def ats_engine(symbol, data):
+    if data is None:
+        return ("WAITING", {'reason': 'No data'}, None)
+
+    s = TRADING_STATES[symbol]
+    pivot = s['pivot']
+
+    df15 = data['df15'];  df4h = data['df4h'];  price = data['price']
+
+    close15 = df15['close'].iloc[-1]
+    prev_close15 = df15['close'].iloc[-2]
+    open15 = df15['open'].iloc[-1]
+    vol15 = df15['volume'].iloc[-1]
+    avg_vol15 = df15['volume'].tail(20).mean()
+    atr15 = df15['ATR'].iloc[-1]
+    rsi15 = df15['RSI'].iloc[-1]
+
+    sma20_4h = df4h['SMA_20'].iloc[-1]
+    ema50_4h = df4h['EMA_50'].iloc[-1]
+
+    # شروط مضارب
+    is_uptrend_near = (sma20_4h >= UPTREND_NEAR_RATIO * ema50_4h)  # انعكاس قريب
+    is_momentum = (rsi15 >= RSI_BREAKOUT_THRESHOLD)
+    body_len = abs(close15 - open15)
+    body_ok = (body_len >= BODY_ATR_FACTOR * atr15)
+    vol_ok = (vol15 >= VOL_MULTIPLIER * avg_vol15)
+
+    # لمس/اختراق المحور
+    touched_pivot = (df15['high'].iloc[-1] >= pivot)
+    break_candle = (close15 > pivot) and (prev_close15 <= pivot)
+
+    state = s['state']
+
+    # ========= إدارة صفقة مفتوحة =========
+    if state == 'LONG':
+        sl = s['stop_loss']; tp1 = s['target_1R']; entry = s['entry_price']
+        # وقف
+        if price <= sl:
+            s['state'] = 'WAITING'
+            return ("EXIT", {'reason': f'Hit SL {sl:.4f}'}, None)
+        # نقل وقف للتعادل بعد 1R
+        if price >= tp1 and sl != entry:
+            s['stop_loss'] = entry
+            return ("MANAGE", {'reason':'TP1 hit → SL to BE', 'new_sl': entry}, None)
+        # فشل اختراق (رجع تحت المحور بحجم/جسم معتبر)
+        if (close15 < pivot and vol_ok and body_ok):
+            s['state'] = 'WAITING'
+            return ("FAKEOUT", {'reason':'Break failed – back under pivot'}, None)
+        return ("LONG", {'info':'Active'}, None)
+
+    # ========= وضع انتظار =========
+    if state == 'WAITING':
+        # استطلاع مبكر لو تحقق شرطان من ثلاثة
+        score = sum([is_uptrend_near, is_momentum, touched_pivot])
+        if score >= 2:
+            s['state'] = 'SCOUT'
+            return ("SCOUT", {'reason':'Early setup (2/3 ready). Wait trigger.'}, None)
+        return ("WAITING", {'reason':'Trend/Momentum not aligned'}, None)
+
+    # ========= استطلاع (هجومي) =========
+    if state == 'SCOUT':
+        # لو فقدنا ميل الترند → رجوع انتظار
+        if not is_uptrend_near:
+            s['state'] = 'WAITING'
+            return ("WAITING", {'reason':'Lost 4h near-trend'}, None)
+
+        # دخول اختراق مبكر
+        if break_candle and body_ok and vol_ok:
+            risk = ATR_MULTIPLIER_SL * atr15
+            sl = close15 - risk
+            tp1 = close15 + risk
+
+            s['state'] = 'LONG'
+            s['entry_price'] = float(close15)
+            s['stop_loss'] = float(sl)
+            s['target_1R'] = float(tp1)
+
+            return ("BREAKOUT", {
+                'entry': round(close15, 4),
+                'sl': round(sl, 4),
+                'tp1': round(tp1, 4),
+                'risk': round(risk, 4),
+                'pivot': pivot
+            }, None)
+
+        # لسه ما تأكد الاختراق
+        return ("SCOUT", {'reason':'Armed & near. Waiting breakout.'}, None)
+
+    return ("WAITING", {'reason':'Fallback'}, None)
+
+# =========================================================
+# 5) حلقة التشغيل
+# =========================================================
+if __name__ == "__main__":
+    try:
+        while True:
+            now = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print("\n" + "#"*90)
+            print(f"🔄 ATS SCANNER (Aggressive Trader) | {now}")
+            print("#"*90)
+
+            for sym in SYMBOLS:
+                data = get_market_data(sym)
+                signal, details, _ = ats_engine(sym, data)
+                st = TRADING_STATES[sym]['state']
+                icon = HEAD.get(signal, "ℹ️")
+                print(f"\n— {icon} {sym} | STATE: {st} —")
+                if details:
+                    for k,v in details.items():
+                        print(f"  • {k}: {v}")
+                # طباعة نقاط الدخول عند الاختراق
+                if signal == "BREAKOUT":
+                    e = details['entry']; sl = details['sl']; tp1 = details['tp1']
+                    print(f"  ▶ Entry {e} | SL {sl} | TP1 {tp1}")
+
+            print("\n" + "="*90)
+            time.sleep(15)  # تحديث كل 15 ثانية
+    except KeyboardInterrupt:
+        print("\nTerminated by user.")
+    except Exception as e:
+        print(f"\nFATAL ERROR: {e}")
